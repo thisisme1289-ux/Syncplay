@@ -112,7 +112,9 @@ app.delete('/file/:filename', (req, res) => {
 });
 
 // ─── WebSocket ────────────────────────────────────────────────────────────
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  console.log(`[WS] Client connected from ${ip}. Total: ${wss.clients.size}`);
   ws.roomCode = null;
   ws.isHost = false;
   ws.username = 'User';
@@ -124,6 +126,11 @@ wss.on('connection', (ws) => {
     const room = ws.roomCode ? rooms[ws.roomCode] : null;
 
     switch (msg.type) {
+
+      // ── Ping (keep-alive from client) ─────────────────────────────────
+      case 'ping':
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
 
       // ── Create Room ──────────────────────────────────────────────────
       case 'create-room': {
