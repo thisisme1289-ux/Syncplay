@@ -236,11 +236,27 @@ function applyContent(content, playState) {
 
 function applyPlayState(ps) {
   State.playState = ps;
+
   if (State.content?.type === 'local' && State.localMediaEl) {
     const el = State.localMediaEl;
-    if (Math.abs(el.currentTime - ps.currentTime) > 2) el.currentTime = ps.currentTime;
-    ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
+    const drift = Math.abs(el.currentTime - ps.currentTime);
+
+    if (drift > 2) {
+      // Pause first, seek, then resume — prevents audio buffer corruption
+      el.pause();
+      el.currentTime = ps.currentTime;
+      if (ps.action === 'play') {
+        const onSeeked = () => {
+          el.removeEventListener('seeked', onSeeked);
+          el.play().catch(() => {});
+        };
+        el.addEventListener('seeked', onSeeked);
+      }
+    } else {
+      ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
+    }
     updatePlayButton(ps.action === 'play');
+
   } else if (State.ytPlayer && State.ytReady) {
     if (State.content?.type === 'youtube-playlist') {
       if (State.ytPlayer.getPlaylistIndex?.() !== (ps.videoIndex || 0))
@@ -590,14 +606,31 @@ function updatePlayButton(isPlaying) {
 function seek(delta) {
   if (!State.isHost && State.controlMode !== 'shared') return;
   if (!State.content) return;
+
   let newTime = 0;
+
   if (State.content.type === 'local' && State.localMediaEl) {
-    newTime = Math.max(0, State.localMediaEl.currentTime + delta);
-    State.localMediaEl.currentTime = newTime;
+    const el = State.localMediaEl;
+    const wasPlaying = State.playState.action === 'play';
+    newTime = Math.max(0, el.currentTime + delta);
+
+    // Pause → seek → resume to prevent audio distortion
+    el.pause();
+    el.currentTime = newTime;
+
+    if (wasPlaying) {
+      const onSeeked = () => {
+        el.removeEventListener('seeked', onSeeked);
+        el.play().catch(() => {});
+      };
+      el.addEventListener('seeked', onSeeked);
+    }
+
   } else if (State.ytPlayer && State.ytReady) {
     newTime = Math.max(0, (State.ytPlayer.getCurrentTime?.() || 0) + delta);
     State.ytPlayer.seekTo?.(newTime, true);
   }
+
   State.playState.currentTime = newTime;
   send({ type: 'play-state', action: State.playState.action, currentTime: newTime, videoIndex: State.playState.videoIndex || 0 });
 }
