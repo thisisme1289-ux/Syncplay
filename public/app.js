@@ -1,23 +1,30 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   SyncPlay — app.js  (v3 - fixed WS timing + ping/pong)
+   SyncPlay — app.js  v4
+   Fixes: blob-based local audio (no seek distortion), YouTube audio proxy
+   (background playback), removed room history, playlist error handling
 ═══════════════════════════════════════════════════════════════════════════ */
 
 const State = {
   ws: null,
   wsReady: false,
-  msgQueue: [],              // ← queue msgs sent before WS is open
+  msgQueue: [],
   roomCode: null,
   isHost: false,
   controlMode: 'host',
   content: null,
   playState: { action: 'pause', currentTime: 0, videoIndex: 0 },
+  // Local file: played via <audio> with a blob: URL (fully in memory)
+  localMediaEl: null,
+  localBlobUrl: null,
+  // YouTube audio: played via <audio> through our server proxy
+  ytAudioEl: null,
+  // YouTube video iframe (fallback when audio proxy not used)
   ytPlayer: null,
   ytReady: false,
   ytQueue: [],
-  localMediaEl: null,
   heartbeatInterval: null,
   syncInterval: null,
-  pingInterval: null,        // ← keep Render connection alive
+  pingInterval: null,
   username: '',
   reconnectTimer: null,
   pendingContent: null,
@@ -51,6 +58,7 @@ async function getYTPlaylistIds(url) {
   if (!m) return null;
   try {
     const rss = await fetch(`https://www.youtube.com/feeds/videos.xml?playlist_id=${m[1]}`);
+    if (!rss.ok) throw new Error('RSS fetch failed');
     const text = await rss.text();
     const xml = new DOMParser().parseFromString(text, 'application/xml');
     const ids = [];
@@ -60,7 +68,10 @@ async function getYTPlaylistIds(url) {
       if (id) ids.push({ id, title: title || id });
     });
     return ids.length ? ids : null;
-  } catch { return null; }
+  } catch(err) {
+    console.error('[Playlist]', err);
+    return null;
+  }
 }
 
 let toastTimer;
@@ -72,7 +83,6 @@ function toast(msg, duration = 2800) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), duration);
 }
-
 function setStatus(msg) {
   const el = document.getElementById('ws-status');
   if (!el) return;
@@ -80,7 +90,7 @@ function setStatus(msg) {
   else { el.classList.remove('visible'); }
 }
 
-// ─── Send — queues if WS not ready yet ───────────────────────────────────
+// ─── Send ─────────────────────────────────────────────────────────────────
 function send(obj) {
   if (obj.type === 'set-content' && obj.contentType === 'youtube-playlist' && State.ytQueue.length) {
     obj.queue = State.ytQueue;
@@ -88,17 +98,13 @@ function send(obj) {
   if (State.ws && State.ws.readyState === WebSocket.OPEN) {
     State.ws.send(JSON.stringify(obj));
   } else {
-    // Queue it — will be flushed when connection opens
     State.msgQueue.push(obj);
   }
 }
-
 function flushQueue() {
   while (State.msgQueue.length) {
     const obj = State.msgQueue.shift();
-    if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-      State.ws.send(JSON.stringify(obj));
-    }
+    if (State.ws?.readyState === WebSocket.OPEN) State.ws.send(JSON.stringify(obj));
   }
 }
 
@@ -106,71 +112,50 @@ function flushQueue() {
 function connectWS() {
   clearInterval(State.pingInterval);
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${protocol}://${location.host}`;
-  console.log('[SyncPlay] Connecting to', url);
   setStatus('⚡ Connecting…');
-
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(`${protocol}://${location.host}`);
   State.ws = ws;
   State.wsReady = false;
 
   ws.onopen = () => {
-    console.log('[SyncPlay] WebSocket connected');
     State.wsReady = true;
     setStatus(null);
     clearTimeout(State.reconnectTimer);
-    flushQueue();   // send anything queued while connecting
-
-    // Ping every 30s to keep Render from closing idle connections
+    flushQueue();
     State.pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
     }, 30000);
   };
-
-  ws.onclose = (e) => {
-    console.log('[SyncPlay] WebSocket closed', e.code, e.reason);
+  ws.onclose = () => {
     State.wsReady = false;
     clearInterval(State.pingInterval);
     setStatus('⚡ Reconnecting…');
     clearTimeout(State.reconnectTimer);
     State.reconnectTimer = setTimeout(connectWS, 3000);
   };
-
-  ws.onerror = (e) => {
-    console.error('[SyncPlay] WebSocket error', e);
-    ws.close();
-  };
-
+  ws.onerror = () => ws.close();
   ws.onmessage = (e) => {
-    let msg;
-    try { msg = JSON.parse(e.data); } catch { return; }
-    if (msg.type === 'pong') return; // ignore pongs
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'pong') return;
     handleMessage(msg);
   };
 }
 
-// ─── Message Handler ──────────────────────────────────────────────────────
+// ─── Messages ─────────────────────────────────────────────────────────────
 function handleMessage(msg) {
-  console.log('[SyncPlay] msg:', msg.type);
+  console.log('[WS]', msg.type);
   switch (msg.type) {
 
     case 'room-created':
       State.roomCode = msg.roomCode;
       State.isHost = true;
-      LS.pushHistory('room', msg.roomCode);
+      // NOTE: No room history saved — room codes expire when room ends
       renderRoom();
       if (State.pendingContent) {
-        const p = State.pendingContent;
-        State.pendingContent = null;
+        const p = State.pendingContent; State.pendingContent = null;
         setTimeout(() => {
-          if (p.type === 'yt') {
-            State.content = { type: 'youtube', url: p.url };
-            State.playState = { action: 'play', currentTime: 0, videoIndex: 0 };
-            send({ type: 'set-content', contentType: 'youtube', url: p.url });
-            renderPlayerArea(); renderNowPlaying();
-          } else {
-            addPlaylistFromUrl(p.url);
-          }
+          if (p.type === 'yt') applyYouTubeUrl(p.url);
+          else addPlaylistFromUrl(p.url);
         }, 400);
       }
       break;
@@ -180,7 +165,6 @@ function handleMessage(msg) {
       State.isHost = false;
       State.controlMode = msg.controlMode;
       if (msg.content) applyContent(msg.content, msg.playState);
-      LS.pushHistory('room', msg.roomCode);
       renderRoom();
       break;
 
@@ -188,7 +172,7 @@ function handleMessage(msg) {
       applyContent(msg.content, msg.playState);
       renderPlayerArea();
       renderNowPlaying();
-      toast(`▶ Now playing: ${msg.content?.filename || 'YouTube'}`);
+      toast(`▶ ${msg.content?.title || msg.content?.filename || 'Content loaded'}`);
       break;
 
     case 'play-state':
@@ -201,18 +185,8 @@ function handleMessage(msg) {
       toast(msg.mode === 'shared' ? '🔓 Anyone can control' : '🔒 Host controls only');
       break;
 
-    case 'sync-response':
-      State.controlMode = msg.controlMode;
-      if (msg.content) applyContent(msg.content, msg.playState);
-      break;
-
-    case 'user-joined':
-      toast(`👋 ${msg.username} joined`);
-      break;
-
-    case 'user-left':
-      toast(`${msg.username} left`);
-      break;
+    case 'user-joined': toast(`👋 ${msg.username} joined`); break;
+    case 'user-left': toast(`${msg.username} left`); break;
 
     case 'host-left':
       toast('Host left the room', 4000);
@@ -221,63 +195,106 @@ function handleMessage(msg) {
       renderHome();
       break;
 
-    case 'error':
-      toast(`❌ ${msg.message}`);
-      break;
+    case 'error': toast(`❌ ${msg.message}`); break;
   }
 }
 
+// ─── Apply Content ────────────────────────────────────────────────────────
 function applyContent(content, playState) {
+  stopAllMedia();
   State.content = content;
   State.playState = playState || { action: 'pause', currentTime: 0, videoIndex: 0 };
   if (content?.type === 'youtube-playlist') State.ytQueue = content.queue || [];
-  stopAllMedia();
 }
 
+// ─── Apply Play State ─────────────────────────────────────────────────────
 function applyPlayState(ps) {
   State.playState = ps;
 
+  // ── Local file (blob in memory — seek is instant, never network) ─────
   if (State.content?.type === 'local' && State.localMediaEl) {
     const el = State.localMediaEl;
     const drift = Math.abs(el.currentTime - ps.currentTime);
-
-    if (drift > 2) {
-      // Pause first, seek, then resume — prevents audio buffer corruption
+    if (drift > 1.5) {
+      // Clean pause → seek → resume
       el.pause();
       el.currentTime = ps.currentTime;
       if (ps.action === 'play') {
-        const onSeeked = () => {
-          el.removeEventListener('seeked', onSeeked);
+        el.addEventListener('seeked', function handler() {
+          el.removeEventListener('seeked', handler);
           el.play().catch(() => {});
-        };
-        el.addEventListener('seeked', onSeeked);
+        });
       }
     } else {
       ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
     }
     updatePlayButton(ps.action === 'play');
 
-  } else if (State.ytPlayer && State.ytReady) {
-    if (State.content?.type === 'youtube-playlist') {
-      if (State.ytPlayer.getPlaylistIndex?.() !== (ps.videoIndex || 0))
-        State.ytPlayer.playVideoAt?.(ps.videoIndex || 0);
+  // ── YouTube audio via proxy (background-capable <audio>) ─────────────
+  } else if (State.content?.type === 'youtube' && State.ytAudioEl) {
+    const el = State.ytAudioEl;
+    const drift = Math.abs(el.currentTime - ps.currentTime);
+    if (drift > 2) {
+      el.pause();
+      el.currentTime = ps.currentTime;
+      if (ps.action === 'play') {
+        el.addEventListener('seeked', function handler() {
+          el.removeEventListener('seeked', handler);
+          el.play().catch(() => {});
+        });
+      }
+    } else {
+      ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
     }
-    if (Math.abs((State.ytPlayer.getCurrentTime?.() || 0) - ps.currentTime) > 2.5)
-      State.ytPlayer.seekTo?.(ps.currentTime, true);
-    ps.action === 'play' ? State.ytPlayer.playVideo?.() : State.ytPlayer.pauseVideo?.();
+    updatePlayButton(ps.action === 'play');
+
+  // ── YouTube playlist via proxy ────────────────────────────────────────
+  } else if (State.content?.type === 'youtube-playlist' && State.ytAudioEl) {
+    const el = State.ytAudioEl;
+    // If video index changed, load the new video's audio
+    if ((ps.videoIndex || 0) !== State.currentYtIdx) {
+      loadYtAudioTrack(ps.videoIndex || 0, ps.currentTime, ps.action === 'play');
+    } else {
+      const drift = Math.abs(el.currentTime - ps.currentTime);
+      if (drift > 2) {
+        el.pause();
+        el.currentTime = ps.currentTime;
+        if (ps.action === 'play') {
+          el.addEventListener('seeked', function handler() {
+            el.removeEventListener('seeked', handler);
+            el.play().catch(() => {});
+          });
+        }
+      } else {
+        ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
+      }
+    }
     updatePlayButton(ps.action === 'play');
   }
 }
 
+// ─── Stop All Media ───────────────────────────────────────────────────────
 function stopAllMedia() {
   if (State.localMediaEl) {
     State.localMediaEl.pause();
     State.localMediaEl.src = '';
     State.localMediaEl = null;
   }
-  if (State.ytPlayer && State.ytReady) { try { State.ytPlayer.stopVideo?.(); } catch {} }
+  if (State.localBlobUrl) {
+    URL.revokeObjectURL(State.localBlobUrl);
+    State.localBlobUrl = null;
+  }
+  if (State.ytAudioEl) {
+    State.ytAudioEl.pause();
+    State.ytAudioEl.src = '';
+    State.ytAudioEl = null;
+  }
+  if (State.ytPlayer && State.ytReady) {
+    try { State.ytPlayer.stopVideo?.(); } catch {}
+  }
   clearInterval(State.heartbeatInterval);
   clearInterval(State.syncInterval);
+  State.currentYtIdx = 0;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -287,7 +304,7 @@ function stopAllMedia() {
 function renderHome() {
   const ytH = LS.getHistory('youtube');
   const plH = LS.getHistory('playlist');
-  const roomH = LS.getHistory('room');
+  // NOTE: No room history shown — codes expire when room ends (by design)
 
   document.getElementById('app').innerHTML = `
     <div class="home-screen scroll-y">
@@ -317,17 +334,6 @@ function renderHome() {
           </div>
         </div>
 
-        ${roomH.length ? `
-          <div class="home-history">
-            <div class="section-title">Recent rooms</div>
-            <div>${roomH.map(c => `
-              <span class="history-chip"
-                onclick="document.getElementById('room-code-input').value='${c}';joinRoom()">
-                <span class="chip-icon">🚪</span>${c}
-              </span>`).join('')}
-            </div>
-          </div>` : ''}
-
         ${ytH.length || plH.length ? `
           <div class="home-history">
             <div class="section-title">Saved links</div>
@@ -345,10 +351,7 @@ function renderHome() {
     <div id="toast" class="toast"></div>
     <div id="ws-status" class="ws-status">⚡ Connecting…</div>
   `;
-
-  // Reflect current connection state
-  if (!State.wsReady) setStatus('⚡ Connecting…');
-  else setStatus(null);
+  if (!State.wsReady) setStatus('⚡ Connecting…'); else setStatus(null);
 }
 
 function renderRoom() {
@@ -376,11 +379,11 @@ function renderRoom() {
       <div class="now-playing" id="now-playing"></div>
 
       <div class="controls ${canControl?'':'locked'}" id="controls">
-        <button class="ctrl-btn" onclick="seek(-10)">⏮</button>
+        <button class="ctrl-btn" onclick="seek(-10)" title="−10s">⏮</button>
         <button class="ctrl-btn play-main" id="play-btn" onclick="togglePlay()">▶</button>
-        <button class="ctrl-btn" onclick="seek(10)">⏭</button>
+        <button class="ctrl-btn" onclick="seek(10)" title="+10s">⏭</button>
         ${State.content?.type==='youtube-playlist'?`
-          <button class="ctrl-btn" onclick="skipVideo(1)">⏩</button>`:''}
+          <button class="ctrl-btn" onclick="skipVideo(1)" title="Next">⏩</button>`:''}
       </div>
 
       ${State.isHost ? `
@@ -392,6 +395,7 @@ function renderRoom() {
         </div>`}
     </div>
 
+    <!-- Bottom Sheet -->
     <div class="sheet-backdrop" id="sheet-backdrop" onclick="closeSheet()"></div>
     <div class="content-sheet" id="content-sheet">
       <div class="sheet-handle"></div>
@@ -404,6 +408,7 @@ function renderRoom() {
         <button class="tab-btn" onclick="switchTab('youtube')">▶ YouTube</button>
         <button class="tab-btn" onclick="switchTab('playlist')">📋 Playlist</button>
       </div>
+
       <div class="tab-panel active" id="tab-local">
         <div class="upload-zone" id="upload-zone"
           onclick="document.getElementById('file-input').click()"
@@ -421,18 +426,26 @@ function renderRoom() {
           <div class="up-status" id="up-status">Uploading…</div>
         </div>
       </div>
+
       <div class="tab-panel" id="tab-youtube">
         <div class="url-row">
           <input type="url" id="yt-input" placeholder="https://youtube.com/watch?v=…" />
           <button class="btn btn-primary" onclick="addYouTube()">Play</button>
         </div>
+        <p class="hint mt-8" style="color:var(--text-dim);font-size:12px">
+          🎵 Plays audio in background — no video needed
+        </p>
         <div id="yt-history"></div>
       </div>
+
       <div class="tab-panel" id="tab-playlist">
         <div class="url-row">
           <input type="url" id="pl-input" placeholder="https://youtube.com/playlist?list=…" />
           <button class="btn btn-primary" onclick="addPlaylist()">Load</button>
         </div>
+        <p class="hint mt-8" style="color:var(--text-dim);font-size:12px">
+          📋 Playlist must be Public on YouTube
+        </p>
         <div id="pl-history"></div>
       </div>
     </div>
@@ -459,16 +472,29 @@ function renderPlayerArea() {
   const area = document.getElementById('player-area');
   if (!area) return;
   if (!State.content) { area.innerHTML = renderEmptyPlayer(); return; }
+
   const c = State.content;
+
   if (c.type === 'local') {
-    area.innerHTML = `<div class="audio-wrapper"><div class="audio-art" id="audio-art">🎵</div></div>`;
-    setupLocalMedia(c);
-  } else if (c.type === 'youtube') {
-    area.innerHTML = `<div class="yt-wrapper"><div id="yt-player"></div></div>`;
-    setupYT([{ id: getYTId(c.url), title: 'Video' }], 0);
-  } else if (c.type === 'youtube-playlist') {
-    area.innerHTML = `<div class="yt-wrapper"><div id="yt-player"></div></div>`;
-    setupYT(State.ytQueue, State.playState.videoIndex || 0);
+    const isVideo = /\.(mp4|webm|mov)$/i.test(c.filename || '');
+    if (isVideo) {
+      area.innerHTML = `<div class="video-wrapper"><video id="local-video" playsInline style="width:100%;max-height:100%;object-fit:contain;background:#000"></video></div>`;
+    } else {
+      area.innerHTML = `<div class="audio-wrapper"><div class="audio-art" id="audio-art">🎵</div></div>`;
+    }
+    setupLocalMedia(c, isVideo);
+
+  } else if (c.type === 'youtube' || c.type === 'youtube-playlist') {
+    // Audio-only player — works in background on mobile
+    area.innerHTML = `
+      <div class="audio-wrapper">
+        <div class="audio-art" id="audio-art">▶</div>
+      </div>`;
+    if (c.type === 'youtube') {
+      setupYtAudio(c.url, 0, State.playState.action === 'play');
+    } else {
+      loadYtAudioTrack(State.playState.videoIndex || 0, State.playState.currentTime, State.playState.action === 'play');
+    }
   }
 }
 
@@ -478,7 +504,7 @@ function renderNowPlaying() {
   const c = State.content;
   let badge = '', name = '';
   if (c.type === 'local') { badge = 'LOCAL'; name = c.filename || 'Local file'; }
-  else if (c.type === 'youtube') { badge = 'YOUTUBE'; name = c.url; }
+  else if (c.type === 'youtube') { badge = 'YOUTUBE'; name = c.title || c.url; }
   else if (c.type === 'youtube-playlist') {
     badge = 'PLAYLIST';
     name = State.ytQueue[State.playState.videoIndex || 0]?.title || 'Playlist';
@@ -486,9 +512,9 @@ function renderNowPlaying() {
   el.innerHTML = `
     <div class="now-playing-info">
       <span class="content-badge">${badge}</span>
-      <span class="song-name">${name}</span>
+      <span class="song-name" id="song-name">${name}</span>
     </div>
-    <div class="progress-track" onclick="seekByClick(event,this)" id="progress-track">
+    <div class="progress-track" onclick="seekByClick(event,this)">
       <div class="progress-fill" id="progress-fill"></div>
     </div>
     <div class="time-row">
@@ -528,7 +554,6 @@ function getUsername() {
 function createRoom() {
   const name = getUsername();
   if (!name) { toast('Enter your name first'); return; }
-  // Show feedback immediately so user knows something is happening
   const btn = document.getElementById('create-btn');
   if (btn) { btn.textContent = '⏳ Creating…'; btn.disabled = true; }
   send({ type: 'create-room', username: name });
@@ -551,8 +576,7 @@ function prefillAndCreate(type, encodedUrl) {
 
 function leaveRoom() {
   stopAllMedia();
-  State.roomCode = null; State.content = null;
-  State.isHost = false; State.ytQueue = [];
+  State.roomCode = null; State.content = null; State.isHost = false; State.ytQueue = [];
   if (State.ws) State.ws.close();
   setTimeout(connectWS, 300);
   renderHome();
@@ -570,30 +594,30 @@ function toggleControlMode() {
 }
 
 function updateControlLock() {
-  const canControl = State.isHost || State.controlMode === 'shared';
-  document.getElementById('controls')?.classList.toggle('locked', !canControl);
+  const can = State.isHost || State.controlMode === 'shared';
+  document.getElementById('controls')?.classList.toggle('locked', !can);
   const tb = document.getElementById('ctrl-toggle-btn');
-  if (tb) {
-    tb.textContent = State.controlMode === 'shared' ? '🔓 Shared' : '🔒 Host only';
-    tb.classList.toggle('shared', State.controlMode === 'shared');
-  }
+  if (tb) { tb.textContent = State.controlMode==='shared'?'🔓 Shared':'🔒 Host only'; tb.classList.toggle('shared', State.controlMode==='shared'); }
   const gb = document.querySelector('.guest-bar p');
-  if (gb) gb.textContent = `🎧 Guest — ${State.controlMode === 'shared' ? 'you can control' : 'host controls'}`;
+  if (gb) gb.textContent = `🎧 Guest — ${State.controlMode==='shared'?'you can control':'host controls'}`;
+}
+
+// ─── Playback ─────────────────────────────────────────────────────────────
+function getActiveEl() {
+  return State.localMediaEl || State.ytAudioEl || null;
 }
 
 function togglePlay() {
   if (!State.isHost && State.controlMode !== 'shared') return;
   if (!State.content) return;
-  const newAction = State.playState.action === 'play' ? 'pause' : 'play';
-  let currentTime = State.localMediaEl?.currentTime || State.ytPlayer?.getCurrentTime?.() || 0;
+  const el = getActiveEl();
+  const isPlaying = el ? !el.paused : State.playState.action === 'play';
+  const newAction = isPlaying ? 'pause' : 'play';
+  const currentTime = el?.currentTime || 0;
   State.playState.action = newAction;
   State.playState.currentTime = currentTime;
   send({ type: 'play-state', action: newAction, currentTime, videoIndex: State.playState.videoIndex || 0 });
-  if (State.content.type === 'local' && State.localMediaEl) {
-    newAction === 'play' ? State.localMediaEl.play().catch(() => {}) : State.localMediaEl.pause();
-  } else if (State.ytPlayer && State.ytReady) {
-    newAction === 'play' ? State.ytPlayer.playVideo?.() : State.ytPlayer.pauseVideo?.();
-  }
+  if (el) newAction === 'play' ? el.play().catch(() => {}) : el.pause();
   updatePlayButton(newAction === 'play');
 }
 
@@ -605,30 +629,22 @@ function updatePlayButton(isPlaying) {
 
 function seek(delta) {
   if (!State.isHost && State.controlMode !== 'shared') return;
-  if (!State.content) return;
+  const el = getActiveEl();
+  if (!el) return;
 
-  let newTime = 0;
+  const wasPlaying = !el.paused;
+  const newTime = Math.max(0, el.currentTime + delta);
 
-  if (State.content.type === 'local' && State.localMediaEl) {
-    const el = State.localMediaEl;
-    const wasPlaying = State.playState.action === 'play';
-    newTime = Math.max(0, el.currentTime + delta);
+  // Always: pause → set position → wait for seeked → resume
+  // This is the ONLY safe way to seek without audio distortion
+  el.pause();
+  el.currentTime = newTime;
 
-    // Pause → seek → resume to prevent audio distortion
-    el.pause();
-    el.currentTime = newTime;
-
-    if (wasPlaying) {
-      const onSeeked = () => {
-        el.removeEventListener('seeked', onSeeked);
-        el.play().catch(() => {});
-      };
-      el.addEventListener('seeked', onSeeked);
-    }
-
-  } else if (State.ytPlayer && State.ytReady) {
-    newTime = Math.max(0, (State.ytPlayer.getCurrentTime?.() || 0) + delta);
-    State.ytPlayer.seekTo?.(newTime, true);
+  if (wasPlaying) {
+    el.addEventListener('seeked', function handler() {
+      el.removeEventListener('seeked', handler);
+      el.play().catch(() => {});
+    });
   }
 
   State.playState.currentTime = newTime;
@@ -637,10 +653,12 @@ function seek(delta) {
 
 function seekByClick(event, track) {
   if (!State.isHost && State.controlMode !== 'shared') return;
-  if (!State.content) return;
+  const el = getActiveEl();
+  if (!el) return;
   const ratio = (event.clientX - track.getBoundingClientRect().left) / track.offsetWidth;
-  const dur = State.localMediaEl?.duration || State.ytPlayer?.getDuration?.() || 0;
-  const cur = State.localMediaEl?.currentTime || State.ytPlayer?.getCurrentTime?.() || 0;
+  const dur = el.duration || 0;
+  if (!dur) return;
+  const cur = el.currentTime;
   seek(ratio * dur - cur);
 }
 
@@ -649,20 +667,15 @@ function skipVideo(dir) {
   const newIdx = Math.max(0, Math.min(State.ytQueue.length - 1, (State.playState.videoIndex || 0) + dir));
   State.playState.videoIndex = newIdx;
   send({ type: 'play-state', action: 'play', currentTime: 0, videoIndex: newIdx });
-  State.ytPlayer?.playVideoAt?.(newIdx);
-  const sn = document.querySelector('.song-name');
-  if (sn) sn.textContent = State.ytQueue[newIdx]?.title || 'Playlist';
+  loadYtAudioTrack(newIdx, 0, true);
 }
 
 function startProgressLoop() {
   clearInterval(State.syncInterval);
   State.syncInterval = setInterval(() => {
-    let cur = 0, dur = 0;
-    if (State.content?.type === 'local' && State.localMediaEl) {
-      cur = State.localMediaEl.currentTime; dur = State.localMediaEl.duration || 0;
-    } else if (State.ytPlayer && State.ytReady) {
-      cur = State.ytPlayer.getCurrentTime?.() || 0; dur = State.ytPlayer.getDuration?.() || 0;
-    }
+    const el = getActiveEl();
+    let cur = el?.currentTime || 0;
+    let dur = el?.duration || 0;
     const fill = document.getElementById('progress-fill');
     if (fill) fill.style.width = dur ? `${(cur/dur)*100}%` : '0%';
     const ce = document.getElementById('time-current');
@@ -676,13 +689,14 @@ function startHeartbeat() {
   clearInterval(State.heartbeatInterval);
   State.heartbeatInterval = setInterval(() => {
     if (!State.isHost) return;
-    const t = State.localMediaEl?.currentTime || State.ytPlayer?.getCurrentTime?.() || 0;
+    const el = getActiveEl();
+    const t = el?.currentTime || 0;
     send({ type: 'heartbeat', currentTime: t, videoIndex: State.playState.videoIndex || 0 });
   }, 5000);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  CONTENT SETUP
+//  LOCAL FILE — Blob-based (the key to distortion-free seeking)
 // ══════════════════════════════════════════════════════════════════════════
 
 function handleFileSelect(e) { if (e.target.files[0]) uploadFile(e.target.files[0]); }
@@ -709,15 +723,16 @@ function uploadFile(file) {
     }
   };
   xhr.onload = () => {
-    if (prog) { prog.classList.remove('visible'); }
+    if (prog) prog.classList.remove('visible');
     if (fill) fill.style.width = '0%';
     if (xhr.status === 200) {
       const data = JSON.parse(xhr.responseText);
       closeSheet();
-      send({ type: 'set-content', contentType: 'local', url: data.streamUrl, fileId: data.fileId, filename: data.filename });
+      send({ type: 'set-content', contentType: 'local', url: data.streamUrl, fileId: data.fileId, filename: data.filename, title: data.filename });
       State.content = { type: 'local', url: data.streamUrl, fileId: data.fileId, filename: data.filename };
       State.playState = { action: 'play', currentTime: 0, videoIndex: 0 };
-      renderPlayerArea(); renderNowPlaying();
+      renderPlayerArea();
+      renderNowPlaying();
       toast(`✅ ${data.filename} loaded`);
     } else { toast('Upload failed'); }
   };
@@ -727,79 +742,160 @@ function uploadFile(file) {
   xhr.send(fd);
 }
 
-function setupLocalMedia(content) {
+function setupLocalMedia(content, isVideo) {
   stopAllMedia();
-  const isVideo = /\.(mp4|webm|mov)$/i.test(content.filename || '');
-  const el = document.createElement(isVideo ? 'video' : 'audio');
-  el.src = content.url; el.preload = 'auto'; el.playsInline = true;
-  State.localMediaEl = el;
-  if (isVideo) {
-    el.style.cssText = 'width:100%;max-height:100%;object-fit:contain;background:#000';
-    const wrapper = document.querySelector('.audio-wrapper');
-    if (wrapper) { wrapper.innerHTML = ''; const vw = document.createElement('div'); vw.className = 'video-wrapper'; vw.appendChild(el); wrapper.appendChild(vw); }
-  }
-  el.addEventListener('ended', () => { updatePlayButton(false); State.playState.action = 'pause'; });
-  el.addEventListener('canplay', () => {
-    if (State.playState.currentTime > 0) el.currentTime = State.playState.currentTime;
-    if (State.playState.action === 'play') el.play().catch(() => {});
-    renderNowPlaying();
-  });
-  startProgressLoop(); startHeartbeat();
-}
 
-let ytAPIReady = false;
-window.onYouTubeIframeAPIReady = () => { ytAPIReady = true; };
+  // Show loading indicator
+  const art = document.getElementById('audio-art');
+  if (art) art.textContent = '⏳';
 
-function setupYT(queue, startIndex) {
-  if (!queue?.length) return;
-  State.ytQueue = queue; State.ytReady = false;
-  const trySetup = () => {
-    if (!ytAPIReady) { setTimeout(trySetup, 300); return; }
-    if (!document.getElementById('yt-player')) return;
-    if (State.ytPlayer) { try { State.ytPlayer.destroy(); } catch {} }
-    const ids = queue.map(v => v.id);
-    State.ytPlayer = new YT.Player('yt-player', {
-      width: '100%', height: '100%', videoId: ids[0],
-      playerVars: { autoplay: 0, playlist: ids.join(','), index: startIndex, controls: 0, rel: 0, modestbranding: 1, playsinline: 1, enablejsapi: 1 },
-      events: {
-        onReady: (e) => {
-          State.ytReady = true;
-          if (startIndex > 0) e.target.playVideoAt?.(startIndex);
-          if (State.playState.currentTime > 2) e.target.seekTo?.(State.playState.currentTime, true);
-          if (State.playState.action === 'play') e.target.playVideo?.();
-          startProgressLoop(); startHeartbeat();
-        },
-        onStateChange: (e) => {
-          if (e.data === YT.PlayerState.PLAYING) updatePlayButton(true);
-          if (e.data === YT.PlayerState.PAUSED) updatePlayButton(false);
-          if (e.data === YT.PlayerState.ENDED && State.ytQueue.length > 1) {
-            const next = (State.playState.videoIndex || 0) + 1;
-            if (next < State.ytQueue.length) {
-              State.playState.videoIndex = next;
-              send({ type: 'play-state', action: 'play', currentTime: 0, videoIndex: next });
-              const sn = document.querySelector('.song-name');
-              if (sn) sn.textContent = State.ytQueue[next]?.title || 'Playlist';
-            }
-          }
-        },
-      },
+  // Fetch the ENTIRE file as a Blob — once it's in memory,
+  // seeking is instant and never hits the network again
+  fetch(content.url)
+    .then(r => {
+      if (!r.ok) throw new Error('Fetch failed: ' + r.status);
+      return r.blob();
+    })
+    .then(blob => {
+      const blobUrl = URL.createObjectURL(blob);
+      State.localBlobUrl = blobUrl;
+
+      let el;
+      if (isVideo) {
+        el = document.getElementById('local-video');
+        if (!el) { el = document.createElement('video'); }
+        el.playsInline = true;
+      } else {
+        el = document.createElement('audio');
+      }
+
+      el.src = blobUrl;
+      el.preload = 'auto';
+      State.localMediaEl = el;
+
+      if (art) art.textContent = '🎵';
+
+      el.addEventListener('canplay', () => {
+        if (State.playState.currentTime > 0) el.currentTime = State.playState.currentTime;
+        if (State.playState.action === 'play') el.play().catch(() => {});
+        renderNowPlaying();
+        updatePlayButton(State.playState.action === 'play');
+      });
+
+      el.addEventListener('ended', () => {
+        updatePlayButton(false);
+        State.playState.action = 'pause';
+      });
+
+      startProgressLoop();
+      startHeartbeat();
+    })
+    .catch(err => {
+      console.error('[LocalMedia]', err);
+      toast('❌ Failed to load file');
+      if (art) art.textContent = '❌';
     });
-  };
-  trySetup();
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+//  YOUTUBE AUDIO PROXY — Background-capable <audio> element
+// ══════════════════════════════════════════════════════════════════════════
+
+async function setupYtAudio(ytUrl, startTime, autoplay) {
+  stopAllMedia();
+
+  const art = document.getElementById('audio-art');
+  if (art) art.textContent = '⏳';
+
+  const el = new Audio();
+  el.src = `/yt-audio?url=${encodeURIComponent(ytUrl)}`;
+  el.preload = 'auto';
+  State.ytAudioEl = el;
+
+  el.addEventListener('canplay', () => {
+    if (startTime > 1) el.currentTime = startTime;
+    if (autoplay) el.play().catch(() => {});
+    if (art) art.textContent = '🎵';
+    renderNowPlaying();
+    updatePlayButton(autoplay);
+  });
+
+  el.addEventListener('ended', () => {
+    updatePlayButton(false);
+    State.playState.action = 'pause';
+    // Auto-advance playlist
+    if (State.content?.type === 'youtube-playlist') {
+      const next = (State.playState.videoIndex || 0) + 1;
+      if (next < State.ytQueue.length) {
+        skipVideo(1);
+      }
+    }
+  });
+
+  el.addEventListener('error', (e) => {
+    console.error('[YtAudio] error', e);
+    if (art) art.textContent = '❌';
+    toast('❌ Could not load YouTube audio');
+  });
+
+  startProgressLoop();
+  startHeartbeat();
+}
+
+State.currentYtIdx = 0;
+function loadYtAudioTrack(idx, startTime, autoplay) {
+  if (!State.ytQueue[idx]) return;
+  State.currentYtIdx = idx;
+  const videoId = State.ytQueue[idx].id;
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+  // Update now playing title immediately
+  const sn = document.getElementById('song-name');
+  if (sn) sn.textContent = State.ytQueue[idx].title || 'Loading…';
+
+  if (State.ytAudioEl) {
+    // Reuse existing element — just change src
+    State.ytAudioEl.pause();
+    State.ytAudioEl.src = `/yt-audio?url=${encodeURIComponent(ytUrl)}`;
+    State.ytAudioEl.load();
+    State.ytAudioEl.addEventListener('canplay', function handler() {
+      State.ytAudioEl.removeEventListener('canplay', handler);
+      if (startTime > 1) State.ytAudioEl.currentTime = startTime;
+      if (autoplay) State.ytAudioEl.play().catch(() => {});
+      updatePlayButton(autoplay);
+    });
+  } else {
+    setupYtAudio(ytUrl, startTime, autoplay);
+  }
+}
+
+// ─── Add YouTube (single video) ───────────────────────────────────────────
 async function addYouTube() {
   const url = document.getElementById('yt-input')?.value.trim();
   if (!url) { toast('Paste a YouTube URL first'); return; }
   if (!getYTId(url)) { toast('Invalid YouTube URL'); return; }
-  LS.pushHistory('youtube', url);
-  closeSheet();
-  send({ type: 'set-content', contentType: 'youtube', url });
-  State.content = { type: 'youtube', url };
-  State.playState = { action: 'play', currentTime: 0, videoIndex: 0 };
-  renderPlayerArea(); renderNowPlaying();
+  await applyYouTubeUrl(url);
 }
 
+async function applyYouTubeUrl(url) {
+  LS.pushHistory('youtube', url);
+  closeSheet();
+
+  // Fetch title from server
+  let title = url;
+  try {
+    const info = await fetch(`/yt-info?url=${encodeURIComponent(url)}`).then(r => r.json());
+    title = info.title || url;
+  } catch {}
+
+  send({ type: 'set-content', contentType: 'youtube', url, title });
+  State.content = { type: 'youtube', url, title };
+  State.playState = { action: 'play', currentTime: 0, videoIndex: 0 };
+  renderPlayerArea();
+  renderNowPlaying();
+}
+
+// ─── Add Playlist ─────────────────────────────────────────────────────────
 async function addPlaylist() {
   const url = document.getElementById('pl-input')?.value.trim();
   if (!url) { toast('Paste a YouTube playlist URL'); return; }
@@ -807,19 +903,36 @@ async function addPlaylist() {
 }
 
 async function addPlaylistFromUrl(url) {
-  toast('⏳ Loading playlist…', 5000);
-  const ids = await getYTPlaylistIds(url);
-  if (!ids?.length) { toast('❌ Could not load playlist. Make sure it is Public.'); return; }
+  toast('⏳ Loading playlist…', 6000);
+
+  let ids = null;
+
+  // Check if it's a single video URL with a list param — still a playlist
+  if (!url.includes('list=')) {
+    toast('❌ Not a playlist URL. Use a URL with ?list= in it.');
+    return;
+  }
+
+  ids = await getYTPlaylistIds(url);
+
+  if (!ids || !ids.length) {
+    toast('❌ Could not load playlist. Make sure it is set to Public on YouTube.');
+    return;
+  }
+
   LS.pushHistory('playlist', url);
   closeSheet();
+
   State.ytQueue = ids;
-  send({ type: 'set-content', contentType: 'youtube-playlist', url });
+  send({ type: 'set-content', contentType: 'youtube-playlist', url, title: `Playlist (${ids.length} tracks)` });
   State.content = { type: 'youtube-playlist', url, queue: ids };
   State.playState = { action: 'play', currentTime: 0, videoIndex: 0 };
-  renderPlayerArea(); renderNowPlaying();
-  toast(`✅ ${ids.length} videos loaded`);
+  renderPlayerArea();
+  renderNowPlaying();
+  toast(`✅ ${ids.length} tracks loaded`);
 }
 
+// ─── Sheet ────────────────────────────────────────────────────────────────
 function openSheet() {
   document.getElementById('sheet-backdrop')?.classList.add('open');
   document.getElementById('content-sheet')?.classList.add('open');
@@ -838,6 +951,5 @@ function switchTab(tab) {
 
 // ─── PWA & Init ───────────────────────────────────────────────────────────
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-
 connectWS();
 renderHome();
