@@ -5,7 +5,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const ytdl = require('@distube/ytdl-core');
+const playdl = require('play-dl');
 
 const app = express();
 const server = http.createServer(app);
@@ -93,57 +93,37 @@ app.get('/stream/:filename', (req, res) => {
   stream.pipe(res);
 });
 
-// ─── YouTube Audio Proxy ───────────────────────────────────────────────────
-// Extracts audio-only stream from YouTube and pipes it to an <audio> element.
-// This allows background playback on mobile (no video = no iframe restrictions).
+// ─── YouTube Audio Proxy (via play-dl) ────────────────────────────────────
 app.get('/yt-audio', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send('Missing url');
-
   try {
-    console.log(`[YT-Audio] Fetching audio for: ${url}`);
-
-    const info = await ytdl.getInfo(url);
-    // Pick best audio-only format
-    const format = ytdl.chooseFormat(info.formats, {
-      quality: 'highestaudio',
-      filter: 'audioonly',
-    });
-
-    if (!format) return res.status(404).send('No audio format found');
-
-    res.setHeader('Content-Type', format.mimeType?.split(';')[0] || 'audio/webm');
+    console.log(`[YT-Audio] ${url}`);
+    const stream = await playdl.stream(url, { quality: 2 });
+    res.setHeader('Content-Type', stream.type === 'opus' ? 'audio/ogg; codecs=opus' : 'audio/mpeg');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache');
-
-    // Also send the video title for the now-playing bar
-    res.setHeader('X-Video-Title', encodeURIComponent(info.videoDetails.title));
-
-    const stream = ytdl.downloadFromInfo(info, { format });
-    stream.on('error', err => {
-      console.error('[YT-Audio] stream error:', err);
-      if (!res.headersSent) res.status(500).end();
-    });
-    stream.pipe(res);
-
+    res.setHeader('Transfer-Encoding', 'chunked');
+    stream.stream.pipe(res);
+    req.on('close', () => { try { stream.stream.destroy(); } catch {} });
   } catch (err) {
-    console.error('[YT-Audio] error:', err.message);
-    res.status(500).send('Could not fetch audio: ' + err.message);
+    console.error('[YT-Audio]', err.message);
+    if (!res.headersSent) res.status(500).send('Could not fetch audio: ' + err.message);
   }
 });
 
-// ─── YouTube Info (title + duration for now-playing) ─────────────────────
+// ─── YouTube Info ─────────────────────────────────────────────────────────
 app.get('/yt-info', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url' });
   try {
-    const info = await ytdl.getInfo(url);
+    const info = await playdl.video_info(url);
     res.json({
-      title: info.videoDetails.title,
-      duration: parseInt(info.videoDetails.lengthSeconds),
-      thumbnail: info.videoDetails.thumbnails?.pop()?.url || null,
+      title: info.video_details.title,
+      duration: info.video_details.durationInSec,
     });
   } catch (err) {
+    console.error('[YT-Info]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
