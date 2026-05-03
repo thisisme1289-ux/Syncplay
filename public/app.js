@@ -230,11 +230,19 @@ function applyPlayState(ps) {
     }
     updatePlayButton(ps.action === 'play');
 
-  // ── YouTube audio via proxy (background-capable <audio>) ─────────────
-  } else if (State.content?.type === 'youtube' && State.ytAudioEl) {
+  // ── YouTube audio via proxy ──────────────────────────────────────────
+  } else if ((State.content?.type === 'youtube' || State.content?.type === 'youtube-playlist') && State.ytAudioEl) {
     const el = State.ytAudioEl;
+
+    // Handle playlist track change
+    if (State.content.type === 'youtube-playlist' && (ps.videoIndex || 0) !== State.currentYtIdx) {
+      loadYtAudioTrack(ps.videoIndex || 0, ps.currentTime, ps.action === 'play');
+      return;
+    }
+
+    // play-dl streams: seeking works if the stream supports it
     const drift = Math.abs(el.currentTime - ps.currentTime);
-    if (drift > 2) {
+    if (drift > 3) {
       el.pause();
       el.currentTime = ps.currentTime;
       if (ps.action === 'play') {
@@ -245,29 +253,6 @@ function applyPlayState(ps) {
       }
     } else {
       ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
-    }
-    updatePlayButton(ps.action === 'play');
-
-  // ── YouTube playlist via proxy ────────────────────────────────────────
-  } else if (State.content?.type === 'youtube-playlist' && State.ytAudioEl) {
-    const el = State.ytAudioEl;
-    // If video index changed, load the new video's audio
-    if ((ps.videoIndex || 0) !== State.currentYtIdx) {
-      loadYtAudioTrack(ps.videoIndex || 0, ps.currentTime, ps.action === 'play');
-    } else {
-      const drift = Math.abs(el.currentTime - ps.currentTime);
-      if (drift > 2) {
-        el.pause();
-        el.currentTime = ps.currentTime;
-        if (ps.action === 'play') {
-          el.addEventListener('seeked', function handler() {
-            el.removeEventListener('seeked', handler);
-            el.play().catch(() => {});
-          });
-        }
-      } else {
-        ps.action === 'play' ? el.play().catch(() => {}) : el.pause();
-      }
     }
     updatePlayButton(ps.action === 'play');
   }
@@ -801,72 +786,74 @@ function setupLocalMedia(content, isVideo) {
 //  YOUTUBE AUDIO PROXY — Background-capable <audio> element
 // ══════════════════════════════════════════════════════════════════════════
 
-async function setupYtAudio(ytUrl, startTime, autoplay) {
-  stopAllMedia();
+State.currentYtIdx = 0;
 
-  const art = document.getElementById('audio-art');
-  if (art) art.textContent = '⏳';
-
+function makeYtAudioEl() {
+  // Destroy previous
+  if (State.ytAudioEl) {
+    State.ytAudioEl.pause();
+    State.ytAudioEl.src = '';
+    State.ytAudioEl = null;
+  }
   const el = new Audio();
-  el.src = `/yt-audio?url=${encodeURIComponent(ytUrl)}`;
-  el.preload = 'auto';
+  // play-dl streams chunked — disable browser range requests
+  el.preload = 'none';
   State.ytAudioEl = el;
-
-  el.addEventListener('canplay', () => {
-    if (startTime > 1) el.currentTime = startTime;
-    if (autoplay) el.play().catch(() => {});
-    if (art) art.textContent = '🎵';
-    renderNowPlaying();
-    updatePlayButton(autoplay);
-  });
 
   el.addEventListener('ended', () => {
     updatePlayButton(false);
     State.playState.action = 'pause';
-    // Auto-advance playlist
     if (State.content?.type === 'youtube-playlist') {
       const next = (State.playState.videoIndex || 0) + 1;
-      if (next < State.ytQueue.length) {
-        skipVideo(1);
-      }
+      if (next < State.ytQueue.length) skipVideo(1);
     }
   });
 
-  el.addEventListener('error', (e) => {
-    console.error('[YtAudio] error', e);
+  el.addEventListener('error', () => {
+    const art = document.getElementById('audio-art');
     if (art) art.textContent = '❌';
-    toast('❌ Could not load YouTube audio');
+    toast('❌ Could not load YouTube audio. Try again.');
+    console.error('[YtAudio] error code:', el.error?.code, el.error?.message);
   });
 
+  return el;
+}
+
+async function setupYtAudio(ytUrl, startTime, autoplay) {
+  const art = document.getElementById('audio-art');
+  if (art) art.textContent = '⏳';
+
+  const el = makeYtAudioEl();
+  // Append timestamp so browser doesn't cache a stale stream
+  el.src = `/yt-audio?url=${encodeURIComponent(ytUrl)}&t=${Date.now()}`;
+
+  el.addEventListener('canplay', function handler() {
+    el.removeEventListener('canplay', handler);
+    if (art) art.textContent = '🎵';
+    // play-dl stream: seeking by time works after canplay
+    if (startTime > 1) {
+      el.currentTime = startTime;
+    }
+    if (autoplay) el.play().catch(e => console.error('[YtAudio] play failed', e));
+    renderNowPlaying();
+    updatePlayButton(autoplay);
+  });
+
+  el.load();
   startProgressLoop();
   startHeartbeat();
 }
 
-State.currentYtIdx = 0;
 function loadYtAudioTrack(idx, startTime, autoplay) {
   if (!State.ytQueue[idx]) return;
   State.currentYtIdx = idx;
   const videoId = State.ytQueue[idx].id;
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  // Update now playing title immediately
   const sn = document.getElementById('song-name');
   if (sn) sn.textContent = State.ytQueue[idx].title || 'Loading…';
 
-  if (State.ytAudioEl) {
-    // Reuse existing element — just change src
-    State.ytAudioEl.pause();
-    State.ytAudioEl.src = `/yt-audio?url=${encodeURIComponent(ytUrl)}`;
-    State.ytAudioEl.load();
-    State.ytAudioEl.addEventListener('canplay', function handler() {
-      State.ytAudioEl.removeEventListener('canplay', handler);
-      if (startTime > 1) State.ytAudioEl.currentTime = startTime;
-      if (autoplay) State.ytAudioEl.play().catch(() => {});
-      updatePlayButton(autoplay);
-    });
-  } else {
-    setupYtAudio(ytUrl, startTime, autoplay);
-  }
+  setupYtAudio(ytUrl, startTime, autoplay);
 }
 
 // ─── Add YouTube (single video) ───────────────────────────────────────────
